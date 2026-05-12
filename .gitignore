@@ -1,0 +1,7 @@
+build/
+.cache/
+managed_components/
+dependencies.lock
+main/secrets.h
+sdkconfig
+sdkconfig.old
