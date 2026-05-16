@@ -42,6 +42,37 @@ typedef enum {
 } theme_t;
 static volatile theme_t s_theme = THEME_DEFAULT;
 
+typedef enum {
+    TOOL_NONE,
+    TOOL_EDIT,
+    TOOL_READ,
+    TOOL_WRITE,
+    TOOL_BASH,
+    TOOL_WEB,
+    TOOL_GREP,
+    TOOL_GLOB,
+    TOOL_TASK,
+    TOOL_OTHER,
+} tool_t;
+static volatile tool_t s_tool = TOOL_NONE;
+static int64_t s_tool_until_us = 0;
+#define TOOL_TTL_US  (60LL * 1000000LL)  // 60s failsafe expiry
+
+// Time-of-day mood. Daemon pushes `time <hh>` on connect and hourly.
+// Until then, default to MOOD_DEFAULT (current behavior unchanged).
+typedef enum {
+    MOOD_DEFAULT,  // 10-17 work hours: as-was
+    MOOD_ALERT,    // 06-10 morning: bright, fast blinks
+    MOOD_MELLOW,   // 17-22 evening: dim backlight
+    MOOD_TIRED,    // 22-06 late night: half-lid, dimmer still
+} mood_t;
+static volatile mood_t s_mood = MOOD_DEFAULT;
+static volatile int   s_hour = -1;  // -1 = unknown
+
+// Number of active Claude Code sessions (capped at 4 for display).
+// Daemon broadcasts when count changes; 1 or 0 = no dots drawn.
+static volatile int s_sessions = 1;
+
 static volatile app_state_t s_app_state = APP_DISCONNECTED;
 static app_state_t          s_prev_state = APP_STANDBY;
 static volatile int64_t     s_notify_us = 0;
@@ -448,6 +479,173 @@ static void draw_theme_overlay(void)
     }
 }
 
+// ─── Tool icon overlay ────────────────────────────────────────────────────────
+// Renders a small ~12x12 glyph in the top-right badge slot during thinking,
+// replacing the theme badge while a tool is active.
+
+static tool_t parse_tool_name(const char *s)
+{
+    if (!s || !*s) return TOOL_NONE;
+    if (strncasecmp(s, "edit",    4) == 0) return TOOL_EDIT;
+    if (strncasecmp(s, "multiedit", 9) == 0) return TOOL_EDIT;
+    if (strncasecmp(s, "read",    4) == 0) return TOOL_READ;
+    if (strncasecmp(s, "write",   5) == 0) return TOOL_WRITE;
+    if (strncasecmp(s, "bash",    4) == 0) return TOOL_BASH;
+    if (strncasecmp(s, "web",     3) == 0) return TOOL_WEB;
+    if (strncasecmp(s, "fetch",   5) == 0) return TOOL_WEB;
+    if (strncasecmp(s, "grep",    4) == 0) return TOOL_GREP;
+    if (strncasecmp(s, "glob",    4) == 0) return TOOL_GLOB;
+    if (strncasecmp(s, "task",    4) == 0) return TOOL_TASK;
+    if (strncasecmp(s, "agent",   5) == 0) return TOOL_TASK;
+    return TOOL_OTHER;
+}
+
+static void draw_tool_overlay(void)
+{
+    if (s_tool == TOOL_NONE) return;
+
+    // Hug the top-right corner: 13px from right edge, 14px from top.
+    // 22px diameter plate (was 18px) for better glyph readability.
+    int bx = LCD_WIDTH - 13;
+    int by = 14;
+    uint16_t fg = C_WHITE;
+    uint16_t accent = RGB565(255, 220, 90);
+    uint16_t bg = RGB565(60, 30, 10);
+
+    // Common circular plate behind glyph for legibility
+    gc9107_fill_circle(bx, by, 11, bg);
+    gc9107_fill_circle(bx, by, 10, RGB565(40, 20, 5));
+
+    switch (s_tool) {
+    case TOOL_EDIT: {
+        // Pencil: thick diagonal shaft + eraser + tip
+        for (int i = -7; i <= 7; i++) {
+            gc9107_draw_pixel(bx + i,     by - i,     fg);
+            gc9107_draw_pixel(bx + i + 1, by - i,     fg);
+            gc9107_draw_pixel(bx + i,     by - i + 1, fg);
+            gc9107_draw_pixel(bx + i + 1, by - i + 1, fg);
+        }
+        gc9107_fill_rect(bx + 4, by - 8, 4, 4, accent);  // eraser
+        gc9107_fill_rect(bx - 8, by + 6, 3, 3, accent);   // graphite tip
+        break;
+    }
+    case TOOL_READ: {
+        // Open book: two pages with spine + text lines
+        gc9107_fill_rect(bx - 9, by - 6, 8, 13, fg);
+        gc9107_fill_rect(bx + 1, by - 6, 8, 13, fg);
+        gc9107_draw_vline(bx,     by - 6, 13, accent);
+        gc9107_draw_hline(bx - 8, by - 3, 7, bg);
+        gc9107_draw_hline(bx + 2, by - 3, 7, bg);
+        gc9107_draw_hline(bx - 8, by,     7, bg);
+        gc9107_draw_hline(bx + 2, by,     7, bg);
+        gc9107_draw_hline(bx - 8, by + 3, 5, bg);
+        gc9107_draw_hline(bx + 2, by + 3, 5, bg);
+        break;
+    }
+    case TOOL_WRITE: {
+        // Page with text lines + folded corner
+        gc9107_fill_rect(bx - 7, by - 8, 14, 17, fg);
+        gc9107_fill_rect(bx + 3, by - 8, 4, 4,  bg);  // folded-corner cut
+        gc9107_draw_pixel(bx + 3, by - 5, accent);
+        gc9107_draw_pixel(bx + 4, by - 4, accent);
+        gc9107_draw_hline(bx - 5, by - 3, 8,  bg);
+        gc9107_draw_hline(bx - 5, by,     10, bg);
+        gc9107_draw_hline(bx - 5, by + 3, 10, bg);
+        gc9107_draw_hline(bx - 5, by + 6, 8,  bg);
+        break;
+    }
+    case TOOL_BASH: {
+        // Chevron ">" + underscore cursor
+        for (int i = 0; i < 5; i++) {
+            gc9107_draw_pixel(bx - 7 + i, by - 5 + i, fg);
+            gc9107_draw_pixel(bx - 6 + i, by - 5 + i, fg);
+            gc9107_draw_pixel(bx - 7 + i, by - 4 + i, fg);
+        }
+        for (int i = 0; i < 5; i++) {
+            gc9107_draw_pixel(bx - 3 + i, by + 0 - i, fg);
+            gc9107_draw_pixel(bx - 2 + i, by + 0 - i, fg);
+            gc9107_draw_pixel(bx - 3 + i, by + 1 - i, fg);
+        }
+        gc9107_fill_rect(bx + 1, by + 5, 7, 2, accent);  // cursor underscore
+        break;
+    }
+    case TOOL_WEB: {
+        // Globe: filled blue disc + latitude/longitude lines + meridian curve
+        gc9107_fill_circle(bx, by, 9, fg);
+        gc9107_fill_circle(bx, by, 8, RGB565(80, 130, 220));
+        gc9107_draw_hline(bx - 8, by,     17, fg);
+        gc9107_draw_hline(bx - 7, by - 4, 15, fg);
+        gc9107_draw_hline(bx - 7, by + 4, 15, fg);
+        gc9107_draw_vline(bx,     by - 8, 17, fg);
+        // Curved meridian (left)
+        gc9107_draw_pixel(bx - 4, by - 7, fg);
+        gc9107_draw_pixel(bx - 5, by - 5, fg);
+        gc9107_draw_pixel(bx - 5, by + 5, fg);
+        gc9107_draw_pixel(bx - 4, by + 7, fg);
+        break;
+    }
+    case TOOL_GREP: {
+        // Magnifying glass: thicker circle + longer diagonal handle
+        gc9107_fill_circle(bx - 2, by - 2, 7, fg);
+        gc9107_fill_circle(bx - 2, by - 2, 5, RGB565(80, 130, 220));
+        for (int i = 0; i < 7; i++) {
+            gc9107_draw_pixel(bx + 3 + i, by + 3 + i, fg);
+            gc9107_draw_pixel(bx + 4 + i, by + 3 + i, fg);
+            gc9107_draw_pixel(bx + 3 + i, by + 4 + i, fg);
+        }
+        break;
+    }
+    case TOOL_GLOB: {
+        // Big asterisk
+        for (int i = -8; i <= 8; i++) {
+            gc9107_draw_pixel(bx + i, by,     fg);
+            gc9107_draw_pixel(bx,     by + i, fg);
+            gc9107_draw_pixel(bx + i, by + i, fg);
+            gc9107_draw_pixel(bx + i, by - i, fg);
+        }
+        gc9107_fill_rect(bx - 1, by - 1, 3, 3, accent);
+        break;
+    }
+    case TOOL_TASK: {
+        // Gear: ring with 4 teeth + hub
+        gc9107_fill_circle(bx, by, 8, fg);
+        gc9107_fill_circle(bx, by, 4, bg);
+        gc9107_fill_rect(bx - 2, by - 10, 4, 4, fg);
+        gc9107_fill_rect(bx - 2, by + 6,  4, 4, fg);
+        gc9107_fill_rect(bx - 10, by - 2, 4, 4, fg);
+        gc9107_fill_rect(bx + 6,  by - 2, 4, 4, fg);
+        gc9107_fill_circle(bx, by, 2, accent);  // hub dot
+        break;
+    }
+    case TOOL_OTHER:
+    default: {
+        // Three dots (bigger)
+        gc9107_fill_rect(bx - 7, by - 2, 4, 4, fg);
+        gc9107_fill_rect(bx - 2, by - 2, 4, 4, fg);
+        gc9107_fill_rect(bx + 3, by - 2, 4, 4, fg);
+        break;
+    }
+    }
+}
+
+// ─── Session-count dots (bottom edge) ────────────────────────────────────────
+// Drawn only when 2+ sessions are active (1 session = no clutter).
+
+static void draw_session_dots(uint16_t color)
+{
+    int n = s_sessions;
+    if (n < 2) return;
+    if (n > 4) n = 4;
+
+    // 4px dots, 4px gaps → total width = 4*n + 4*(n-1) = 8n - 4
+    int total_w = 8 * n - 4;
+    int x0 = (LCD_WIDTH - total_w) / 2;
+    int y = LCD_HEIGHT - 5;
+    for (int i = 0; i < n; i++) {
+        gc9107_fill_rect(x0 + i * 8, y, 4, 4, color);
+    }
+}
+
 // ─── Screen renderers ─────────────────────────────────────────────────────────
 
 static void draw_disconnected(void)
@@ -459,6 +657,7 @@ static void draw_disconnected(void)
     draw_centred(88,  "Connect via BLE:", C_GREY_DIM, C_GREY_BG, 1);
     draw_centred(102, DEVICE_NAME,        C_GREY_LT,  C_GREY_BG, 1);
     draw_centred(116, "waiting...",       C_GREY_DIM, C_GREY_BG, 1);
+    draw_session_dots(C_GREY_DIM);
     draw_theme_overlay();
 }
 
@@ -476,8 +675,15 @@ static void draw_standby(void)
         else if (s_blink_variant == BLINK_WINK_R) L = EYE_OPEN;
         else if (s_blink_variant == BLINK_EYE_ROLL) { L = R = EYE_OPEN; extra_y = -4; }
     }
+    // MOOD_TIRED: half-lid eyes when not mid-blink; slight downward droop.
+    // MOOD_ALERT / MOOD_MELLOW / MOOD_DEFAULT: no shape change — only backlight differs.
+    if (s_mood == MOOD_TIRED && s_blink_phase == 0) {
+        L = R = EYE_HALF;
+        extra_y = 2;
+    }
     draw_eyes_split(EYE_L_X+ox, EYE_R_X+ox, EYE_Y+extra_y, L, R, C_EYE);
     draw_centred(108, "BLE connected", C_FAINT, C_ORANGE, 1);
+    draw_session_dots(C_DIM);
     draw_theme_overlay();
 }
 
@@ -501,7 +707,10 @@ static void draw_thinking(void)
     }
     draw_eyes_split(EYE_L_X+ox, EYE_R_X+ox, EYE_Y+oy+extra_y, L, R, C_EYE);
     draw_centred(108, "thinking...", C_DIM, C_ORANGE, 1);
-    draw_theme_overlay();
+    draw_session_dots(C_DIM);
+    // Tool icon replaces theme badge while a tool is active
+    if (s_tool != TOOL_NONE) draw_tool_overlay();
+    else                     draw_theme_overlay();
 }
 
 static void draw_done(void)
@@ -518,6 +727,7 @@ static void draw_done(void)
     else if (secs < 60) snprintf(elapsed, sizeof(elapsed), "%llds ago", (long long)secs);
     else                snprintf(elapsed, sizeof(elapsed), "%lldm ago", (long long)(secs/60));
     draw_centred(110, elapsed, C_DONE_DIM, C_DONE_BG, 1);
+    draw_session_dots(C_DONE_DIM);
     draw_theme_overlay();
 }
 
@@ -529,6 +739,7 @@ static void draw_waiting(void)
     draw_pixel_eye(EYE_L_X+ox, EYE_Y, &BMP_CHEVRON_R[0][0], 5, C_BLUE_EYE);
     draw_pixel_eye(EYE_R_X+ox, EYE_Y, &BMP_CHEVRON_L[0][0], 5, C_BLUE_EYE);
     draw_centred(106, "your input?", C_BLUE_LT, C_BLUE_BG, 1);
+    draw_session_dots(C_BLUE_DIM);
     draw_theme_overlay();
 }
 
@@ -624,6 +835,32 @@ static void on_ble_cmd(ble_cmd_t cmd, const char *arg)
         else                                          s_theme = THEME_DEFAULT;
         ESP_LOGI(TAG, "theme set: %s -> %d", arg, s_theme);
         break;
+    case BLE_CMD_TOOL:
+        s_tool = parse_tool_name(arg);
+        s_tool_until_us = (s_tool == TOOL_NONE) ? 0 : esp_timer_get_time() + TOOL_TTL_US;
+        ESP_LOGI(TAG, "tool set: %s -> %d", arg ? arg : "(clear)", s_tool);
+        break;
+    case BLE_CMD_TIME: {
+        if (!arg) break;
+        int h = atoi(arg);
+        if (h < 0 || h > 23) break;
+        s_hour = h;
+        if      (h >= 6  && h < 10) s_mood = MOOD_ALERT;
+        else if (h >= 10 && h < 17) s_mood = MOOD_DEFAULT;
+        else if (h >= 17 && h < 22) s_mood = MOOD_MELLOW;
+        else                        s_mood = MOOD_TIRED;
+        ESP_LOGI(TAG, "time set: hour=%d mood=%d", h, s_mood);
+        break;
+    }
+    case BLE_CMD_SESSIONS: {
+        if (!arg) break;
+        int n = atoi(arg);
+        if (n < 0) n = 0;
+        if (n > 4) n = 4;
+        s_sessions = n;
+        ESP_LOGI(TAG, "sessions: %d", n);
+        break;
+    }
     }
 }
 
@@ -769,6 +1006,15 @@ void app_main(void)
             if (age > 300) enter_state(now_connected ? APP_STANDBY : APP_DISCONNECTED);
         }
 
+        // ── Tool icon TTL: clear if daemon went silent for >60s ─────────────
+        if (s_tool != TOOL_NONE && now > s_tool_until_us) {
+            s_tool = TOOL_NONE;
+        }
+        // Tool icon only makes sense during THINKING; clear on state change away
+        if (s_app_state != APP_THINKING && s_tool != TOOL_NONE) {
+            s_tool = TOOL_NONE;
+        }
+
         // ── Dizzy / disco timeouts ───────────────────────────────────────────
         if (s_app_state == APP_DIZZY && now > s_dizzy_until_us) {
             s_app_state = s_prev_state;
@@ -785,8 +1031,14 @@ void app_main(void)
             // don't mark_event() here — we want SLEEPY to be the stable state
         }
 
-        // ── Backlight: dim in sleepy, party-flash in disco, normal otherwise ─
+        // ── Backlight: dim in sleepy, party-flash in disco, mood-adjusted otherwise
         uint8_t want_bl = 200;
+        switch (s_mood) {
+        case MOOD_ALERT:   want_bl = 230; break;
+        case MOOD_DEFAULT: want_bl = 200; break;
+        case MOOD_MELLOW:  want_bl = 150; break;
+        case MOOD_TIRED:   want_bl = 100; break;
+        }
         if (s_app_state == APP_SLEEPY) want_bl = 30;
         else if (s_app_state == APP_DISCO) {
             // strobe between 80 and 255

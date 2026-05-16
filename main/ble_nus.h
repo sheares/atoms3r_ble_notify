@@ -8,6 +8,9 @@ typedef enum {
     BLE_CMD_STANDBY,
     BLE_CMD_DIZZY,
     BLE_CMD_THEME,
+    BLE_CMD_TOOL,
+    BLE_CMD_TIME,
+    BLE_CMD_SESSIONS,
 } ble_cmd_t;
 
 typedef void (*ble_cmd_cb_t)(ble_cmd_t cmd, const char *arg);
