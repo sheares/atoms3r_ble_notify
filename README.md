@@ -13,11 +13,14 @@ works behind enterprise captive portals).
   Priority order: `waiting > done > thinking > standby`. So it always
   shouts the most actionable thing.
 - **Bottom status bar:** one colored segment per active Claude session
-  (up to 4). Tells you *which* session is in which state.
+  (up to 4), each labeled with the session's `cwd` basename so you can
+  tell *which* terminal is in which state.
   - 🔵 blue = waiting for your input
   - 🟢 green = done
   - 🟠 orange = thinking
   - ⚫ grey = idle
+  - Labels auto-size: 5×8 font with 1–2 sessions, switch to a tiny
+    3×5 uppercase font at 3+ sessions so they still fit.
 - **Tool icon (top-right):** which tool Claude is using right now
   (edit/read/bash/grep/web/…).
 - **Time-of-day mood:** backlight dims and eyes droop late at night,
@@ -89,6 +92,7 @@ Send ASCII commands to the Nordic UART RX characteristic
 | `standby` / `clear` | Face → standby |
 | `dizzy` | Easter egg: spinning eyes |
 | `bar <codes>` | Bottom bar segments. Codes: `T`/`W`/`D`/`.` per slot. E.g. `bar TWD.` = 4 segments: thinking, waiting, done, idle |
+| `labels <a>\|<b>\|...` | Per-segment labels (pipe-separated, up to 4). E.g. `labels esp\|main\|\|blog` (empty slot 2) |
 | `tool <name>` | Top-right tool icon (`edit`/`read`/`bash`/`grep`/`glob`/`web`/`fetch`/`task`/`agent`/`other`) |
 | `tool` | Clear tool icon |
 | `theme <name>` | Top-right theme badge (`weekend`/`cny`/`christmas`/`national_day`/`deepavali`/`new_year`/`default`) |
@@ -113,9 +117,14 @@ on `localhost:8765`:
 | `GET /sessions/<n>` | Debug: synthesize `n` idle slots |
 
 Per-session state is tracked with a 5-minute TTL. After every event the
-daemon recomputes the bar payload + face state and broadcasts both if
-either changed. Slots are stable: first-seen keeps slot 0 until its TTL
-expires, so colors don't shift around when sessions come and go.
+daemon recomputes the bar codes, labels, and face state and broadcasts
+whichever changed. Slots are stable: first-seen keeps slot 0 until its
+TTL expires, so colors don't shift around when sessions come and go.
+
+Labels come from each session's `cwd` basename (sent by the hook script).
+The daemon picks the longest single token (split on `_-space`) that fits
+the current per-segment budget. When sessions get crowded the firmware
+switches to a tiny 3×5 uppercase font to keep labels readable.
 
 ## Easter eggs
 
