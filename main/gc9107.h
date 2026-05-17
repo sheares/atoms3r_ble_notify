@@ -53,3 +53,8 @@ void     gc9107_fill_circle(int16_t cx, int16_t cy, int16_t r, uint16_t color);
 // Text – scale=1 → 6×9 rendered size (5×8 glyph + 1px spacing)
 void     gc9107_draw_char(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale);
 void     gc9107_draw_string(int16_t x, int16_t y, const char *str, uint16_t fg, uint16_t bg, uint8_t scale);
+
+// Tiny text – 3×5 glyph, 4px wide rendered (3px + 1px gap). For crowded UI
+// like per-segment bar labels. Supports uppercase + digits + space/-/./_.
+void     gc9107_draw_char_tiny(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg);
+void     gc9107_draw_string_tiny(int16_t x, int16_t y, const char *str, uint16_t fg, uint16_t bg);

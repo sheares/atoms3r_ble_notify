@@ -64,7 +64,8 @@ _last_labels_payload: str = ""
 SESSION_TTL_S = 5 * 60
 MAX_SLOTS     = 4
 LCD_WIDTH     = 128
-CHAR_PX       = 6      # 5x8 font + 1px spacing
+CHAR_PX_BIG   = 6      # 5x8 font + 1px spacing (used at 1-2 slots)
+CHAR_PX_TINY  = 4      # 3x5 font + 1px spacing (used at 3+ slots)
 SEG_PADDING   = 2      # divider + a hair of margin
 LABEL_HARD_MAX = 21    # firmware buffer cap (s_labels[4][22])
 
@@ -205,11 +206,13 @@ def _build_bar_payload() -> str:
 
 
 def _chars_per_segment(n_slots: int) -> int:
-    """How many chars fit in one bar segment when n_slots share the 128px bar."""
+    """How many chars fit in one bar segment when n_slots share the 128px bar.
+    Mirrors firmware: 1-2 slots use 5x8 font, 3+ slots switch to the tiny 3x5."""
     if n_slots < 1:
         return LABEL_HARD_MAX
     seg_w = LCD_WIDTH // n_slots
-    fits = (seg_w - SEG_PADDING) // CHAR_PX
+    char_px = CHAR_PX_TINY if n_slots >= 3 else CHAR_PX_BIG
+    fits = (seg_w - SEG_PADDING) // char_px
     return max(2, min(LABEL_HARD_MAX, fits))
 
 

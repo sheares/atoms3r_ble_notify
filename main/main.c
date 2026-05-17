@@ -686,14 +686,32 @@ static void draw_bottom_bar(uint16_t fallback)
         uint16_t bg = bar_seg_color(s_bar_states[i], fallback);
         gc9107_fill_rect(x, BAR_Y, w, BAR_H, bg);
         if (i > 0) gc9107_fill_rect(x, BAR_Y, 1, BAR_H, RGB565(0,0,0));
-        // Label centered inside the segment (white on segment color)
+        // Label centered inside the segment (white on segment color).
+        // Use 5x8 font for 1-2 sessions, tiny 3x5 font (uppercased) for 3+
+        // since segments get too narrow for the regular font.
         const char *lbl = s_labels[i];
         if (lbl[0]) {
-            int len  = (int)strlen(lbl);
-            int text_w = len * 6 - 1;  // 5px char + 1px gap, scale 1, no trailing gap
-            int tx = x + (w - text_w) / 2;
-            if (tx < x + 1) tx = x + 1;  // keep clear of divider
-            gc9107_draw_string(tx, BAR_Y + 1, lbl, C_WHITE, bg, 1);
+            int len = (int)strlen(lbl);
+            if (n <= 2) {
+                int text_w = len * 6 - 1;  // 5+1 spacing, no trailing gap
+                int tx = x + (w - text_w) / 2;
+                if (tx < x + 1) tx = x + 1;
+                gc9107_draw_string(tx, BAR_Y + 1, lbl, C_WHITE, bg, 1);
+            } else {
+                // Tiny path: uppercase into a stack buffer, then draw.
+                char up[LABEL_MAX];
+                int j = 0;
+                for (; j < LABEL_MAX - 1 && lbl[j]; j++) {
+                    char c = lbl[j];
+                    if (c >= 'a' && c <= 'z') c -= 32;
+                    up[j] = c;
+                }
+                up[j] = 0;
+                int text_w = j * 4 - 1;  // 3+1 spacing, no trailing gap
+                int tx = x + (w - text_w) / 2;
+                if (tx < x + 1) tx = x + 1;
+                gc9107_draw_string_tiny(tx, BAR_Y + 3, up, C_WHITE, bg);
+            }
         }
     }
 }

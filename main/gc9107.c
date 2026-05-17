@@ -1,5 +1,6 @@
 #include "gc9107.h"
 #include "font.h"
+#include "font_tiny.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -334,5 +335,26 @@ void gc9107_draw_string(int16_t x, int16_t y, const char *str, uint16_t fg, uint
         gc9107_draw_char(x, y, *str++, fg, bg, scale);
         x += (FONT_WIDTH + 1) * scale;
         if (x + FONT_WIDTH * scale > LCD_WIDTH) break;
+    }
+}
+
+void gc9107_draw_char_tiny(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg)
+{
+    if (c < FONT_TINY_FIRST || c > FONT_TINY_LAST) c = ' ';
+    const uint8_t *glyph = font_tiny[c - FONT_TINY_FIRST];
+    for (uint8_t col = 0; col < FONT_TINY_W; col++) {
+        uint8_t col_data = glyph[col];
+        for (uint8_t row = 0; row < FONT_TINY_H; row++) {
+            fb_pixel(x + col, y + row, (col_data & (1 << row)) ? fg : bg);
+        }
+    }
+}
+
+void gc9107_draw_string_tiny(int16_t x, int16_t y, const char *str, uint16_t fg, uint16_t bg)
+{
+    while (*str) {
+        gc9107_draw_char_tiny(x, y, *str++, fg, bg);
+        x += FONT_TINY_W + 1;  // 1px inter-char gap
+        if (x + FONT_TINY_W > LCD_WIDTH) break;
     }
 }
