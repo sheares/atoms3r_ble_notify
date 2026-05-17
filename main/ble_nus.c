@@ -60,6 +60,7 @@ static int nus_rx_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     else if (strncmp(buf, "tool",     4) == 0) s_cmd_cb(BLE_CMD_TOOL,     NULL);
     else if (strncmp(buf, "time ",    5) == 0) s_cmd_cb(BLE_CMD_TIME,     buf + 5);
     else if (strncmp(buf, "sessions ", 9) == 0) s_cmd_cb(BLE_CMD_SESSIONS, buf + 9);
+    else if (strncmp(buf, "bar ",      4) == 0) s_cmd_cb(BLE_CMD_BAR,      buf + 4);
 
     return 0;
 }

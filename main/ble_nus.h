@@ -11,6 +11,7 @@ typedef enum {
     BLE_CMD_TOOL,
     BLE_CMD_TIME,
     BLE_CMD_SESSIONS,
+    BLE_CMD_BAR,
 } ble_cmd_t;
 
 typedef void (*ble_cmd_cb_t)(ble_cmd_t cmd, const char *arg);

@@ -49,10 +49,17 @@ _thinking_history: deque = deque()
 _last_dizzy_ts: float = 0.0
 _current_theme: str = ""
 
-# session_id → last-seen monotonic timestamp. Sessions older than 5min are evicted.
-_sessions: dict[str, float] = {}
-_last_pushed_session_count: int = -1
+# Per-session tracking. Sessions older than SESSION_TTL_S are evicted.
+#   _session_seen   : sid → last-seen monotonic timestamp
+#   _session_states : sid → 'T'/'W'/'D' (state char for the bar)
+#   _session_slots  : sid → 0..3 (stable slot index, freed only on eviction)
+_session_seen:   dict[str, float] = {}
+_session_states: dict[str, str]   = {}
+_session_slots:  dict[str, int]   = {}
+_last_bar_payload:  str = ""
+_last_face_state:   str = ""
 SESSION_TTL_S = 5 * 60
+MAX_SLOTS     = 4
 
 
 # ─── Singapore holiday calendar ──────────────────────────────────────────────
@@ -126,6 +133,11 @@ async def _connect_loop() -> None:
             # Push today's theme + current hour on connect
             await _push_theme()
             await _push_time()
+            # Force a re-broadcast of bar + face so reconnects refresh state.
+            global _last_bar_payload, _last_face_state
+            _last_bar_payload = ""
+            _last_face_state = ""
+            await _broadcast_session_view()
             return
         except Exception as exc:
             log.error("connection failed: %s — retrying in 5 s", exc)
@@ -152,28 +164,81 @@ async def _push_theme() -> None:
 
 def _evict_old_sessions() -> None:
     now = time.monotonic()
-    stale = [sid for sid, ts in _sessions.items() if now - ts > SESSION_TTL_S]
+    stale = [sid for sid, ts in _session_seen.items() if now - ts > SESSION_TTL_S]
     for sid in stale:
-        del _sessions[sid]
+        _session_seen.pop(sid, None)
+        _session_states.pop(sid, None)
+        _session_slots.pop(sid, None)
 
 
-async def _track_session(session_id: str | None) -> None:
-    """Mark a session as seen, broadcast new count to firmware if it changed."""
-    global _last_pushed_session_count
+def _alloc_slot(sid: str) -> int | None:
+    """Assign a stable 0..MAX_SLOTS-1 slot to sid. Returns None if full."""
+    if sid in _session_slots:
+        return _session_slots[sid]
+    used = set(_session_slots.values())
+    for i in range(MAX_SLOTS):
+        if i not in used:
+            _session_slots[sid] = i
+            return i
+    return None  # no free slot — session is tracked but not shown on bar
+
+
+def _build_bar_payload() -> str:
+    """Build the bar codes string up to the highest occupied slot index + 1.
+    Empty interior slots show as '.'. Returns '' if no slots are occupied."""
+    if not _session_slots:
+        return ""
+    highest = max(_session_slots.values())
+    slots = ["."] * (highest + 1)
+    for sid, idx in _session_slots.items():
+        slots[idx] = _session_states.get(sid, ".")
+    return "".join(slots)
+
+
+def _compute_face_state() -> str:
+    """Pick the face command based on highest-urgency state across sessions.
+    Priority: W (waiting) > D (done) > T (thinking) > standby."""
+    states = set(_session_states.values())
+    if "W" in states: return "waiting"
+    if "D" in states: return "done"
+    if "T" in states: return "thinking"
+    return "standby"
+
+
+async def _broadcast_session_view() -> None:
+    """Send bar + face commands if either has changed since the last broadcast."""
+    global _last_bar_payload, _last_face_state
+    bar = _build_bar_payload()
+    face = _compute_face_state()
+    if bar != _last_bar_payload:
+        _last_bar_payload = bar
+        if bar:
+            await _send(f"bar {bar}")
+        # No-bar case: nothing to send; firmware will fall back on next render.
+    if face != _last_face_state:
+        _last_face_state = face
+        await _send(face)
+
+
+async def _set_session_state(session_id: str | None, state: str | None) -> None:
+    """Mark a session as seen and (optionally) update its bar state.
+    state in {'T','W','D', None}; None just refreshes the seen-time (e.g. /tool).
+    Broadcasts updated bar + face if anything changed."""
     if session_id:
-        _sessions[session_id] = time.monotonic()
+        _session_seen[session_id] = time.monotonic()
+        if state is not None:
+            _alloc_slot(session_id)
+            _session_states[session_id] = state
     _evict_old_sessions()
-    count = len(_sessions)
-    if count != _last_pushed_session_count:
-        _last_pushed_session_count = count
-        await _send(f"sessions {count}")
+    await _broadcast_session_view()
 
 
 async def _session_evictor() -> None:
-    """Periodically evict stale sessions and push the count if it changed."""
+    """Periodically evict stale sessions and re-broadcast if anything changed."""
     while True:
         await asyncio.sleep(30)
-        await _track_session(None)
+        _evict_old_sessions()
+        await _broadcast_session_view()
 
 
 async def _push_time() -> None:
@@ -201,7 +266,7 @@ def _sid(req: web.Request) -> str | None:
 
 async def handle_thinking(req: web.Request) -> web.Response:
     global _last_dizzy_ts
-    await _track_session(_sid(req))
+    sid = _sid(req)
     now = time.monotonic()
     _thinking_history.append(now)
     # Drop entries older than the window
@@ -213,27 +278,29 @@ async def handle_thinking(req: web.Request) -> web.Response:
         _last_dizzy_ts = now
         _thinking_history.clear()
         log.info("rapid-fire detected → dizzy")
+        # Still update bar state so it's accurate after dizzy clears.
+        await _set_session_state(sid, "T")
         await _send("dizzy")
         return web.Response(text="OK (dizzy)\n")
 
-    await _send("thinking")
+    await _set_session_state(sid, "T")
     return web.Response(text="OK\n")
 
 
 async def handle_question(req: web.Request) -> web.Response:
-    await _track_session(_sid(req))
-    await _send("waiting")
+    await _set_session_state(_sid(req), "W")
     return web.Response(text="OK\n")
 
 
 async def handle_notify(req: web.Request) -> web.Response:
-    await _track_session(_sid(req))
-    await _send("done")
+    await _set_session_state(_sid(req), "D")
     return web.Response(text="OK\n")
 
 
 async def handle_clear(req: web.Request) -> web.Response:
-    await _track_session(_sid(req))
+    # Manual override — forces face to standby without touching per-session state.
+    # (Per-session state is still refreshed via the seen-time path.)
+    await _set_session_state(_sid(req), None)
     await _send("standby")
     return web.Response(text="OK\n")
 
@@ -270,7 +337,8 @@ _TOOL_ALIAS = {
 
 
 async def handle_tool(req: web.Request) -> web.Response:
-    await _track_session(_sid(req))
+    # Tool calls just refresh seen-time; they don't change the bar state.
+    await _set_session_state(_sid(req), None)
     name = req.match_info.get("name", "").strip().lower()
     if not name:
         await _send("tool")  # clear
@@ -281,22 +349,24 @@ async def handle_tool(req: web.Request) -> web.Response:
 
 
 async def handle_tool_clear(req: web.Request) -> web.Response:
-    await _track_session(_sid(req))
+    await _set_session_state(_sid(req), None)
     await _send("tool")
     return web.Response(text="OK tool=(clear)\n")
 
 
 async def handle_sessions(req: web.Request) -> web.Response:
-    """Manual override: GET /sessions/<n>. Bypasses tracking — sets value directly."""
+    """Manual debug override: GET /sessions/<n>. Sends legacy `sessions <n>`
+    plus a synthetic `bar` with n idle slots — useful for layout testing.
+    Does NOT touch the real session tracker."""
     try:
         n = int(req.match_info.get("n", ""))
     except ValueError:
         return web.Response(status=400, text="n must be 0-4\n")
     if n < 0 or n > 4:
         return web.Response(status=400, text="n must be 0-4\n")
-    global _last_pushed_session_count
-    _last_pushed_session_count = n
     await _send(f"sessions {n}")
+    if n > 0:
+        await _send(f"bar {'.' * n}")
     return web.Response(text=f"OK sessions={n}\n")
 
 

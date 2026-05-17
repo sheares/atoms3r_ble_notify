@@ -73,6 +73,12 @@ static volatile int   s_hour = -1;  // -1 = unknown
 // Daemon broadcasts when count changes; 1 or 0 = no dots drawn.
 static volatile int s_sessions = 1;
 
+// Per-session bar state — one char per slot: T=thinking W=waiting D=done .=idle
+// Filled by BLE_CMD_BAR. s_bar_count is the number of segments to draw.
+// Falls back to a single dim segment when no bar data has arrived yet.
+static volatile char s_bar_states[4] = {'.','.','.','.'};
+static volatile int  s_bar_count     = 0;
+
 static volatile app_state_t s_app_state = APP_DISCONNECTED;
 static app_state_t          s_prev_state = APP_STANDBY;
 static volatile int64_t     s_notify_us = 0;
@@ -628,21 +634,50 @@ static void draw_tool_overlay(void)
     }
 }
 
-// ─── Session-count dots (bottom edge) ────────────────────────────────────────
-// Drawn only when 2+ sessions are active (1 session = no clutter).
+// ─── Bottom status bar ───────────────────────────────────────────────────────
+// Reserved zone y=BAR_Y..LCD_HEIGHT-1. Each segment is colored by its
+// per-session state in s_bar_states[] (T/W/D/.). If no bar data has been
+// received yet, falls back to a single segment of the caller-supplied color.
 
-static void draw_session_dots(uint16_t color)
+#define BAR_Y 118
+#define BAR_H 10
+
+static uint16_t bar_seg_color(char state, uint16_t fallback)
 {
-    int n = s_sessions;
-    if (n < 2) return;
+    switch (state) {
+    case 'T': return C_DIM;
+    case 'W': return C_BLUE_DIM;
+    case 'D': return C_DONE_DIM;
+    case '.': return C_GREY_DIM;
+    default:  return fallback;
+    }
+}
+
+static void draw_bottom_bar(uint16_t fallback)
+{
+    int n = s_bar_count;
+    if (n < 1) {
+        // No bar data yet — fall back to legacy s_sessions count + single color
+        n = s_sessions;
+        if (n < 1) n = 1;
+        if (n > 4) n = 4;
+        int seg_w = LCD_WIDTH / n;
+        for (int i = 0; i < n; i++) {
+            int x = i * seg_w;
+            int w = (i == n - 1) ? (LCD_WIDTH - x) : seg_w;
+            gc9107_fill_rect(x, BAR_Y, w, BAR_H, fallback);
+            if (i > 0) gc9107_fill_rect(x, BAR_Y, 1, BAR_H, RGB565(0,0,0));
+        }
+        return;
+    }
     if (n > 4) n = 4;
 
-    // 4px dots, 4px gaps → total width = 4*n + 4*(n-1) = 8n - 4
-    int total_w = 8 * n - 4;
-    int x0 = (LCD_WIDTH - total_w) / 2;
-    int y = LCD_HEIGHT - 5;
+    int seg_w = LCD_WIDTH / n;
     for (int i = 0; i < n; i++) {
-        gc9107_fill_rect(x0 + i * 8, y, 4, 4, color);
+        int x = i * seg_w;
+        int w = (i == n - 1) ? (LCD_WIDTH - x) : seg_w;
+        gc9107_fill_rect(x, BAR_Y, w, BAR_H, bar_seg_color(s_bar_states[i], fallback));
+        if (i > 0) gc9107_fill_rect(x, BAR_Y, 1, BAR_H, RGB565(0,0,0));
     }
 }
 
@@ -654,10 +689,10 @@ static void draw_disconnected(void)
     draw_centred(8, "CLAUDE CODE", C_GREY_DIM, C_GREY_BG, 1);
     int ox = (int)s_eye_ox;
     draw_eyes(EYE_L_X+ox, EYE_R_X+ox, 42, blink_eye_state(), C_GREY_EYE);
-    draw_centred(88,  "Connect via BLE:", C_GREY_DIM, C_GREY_BG, 1);
-    draw_centred(102, DEVICE_NAME,        C_GREY_LT,  C_GREY_BG, 1);
-    draw_centred(116, "waiting...",       C_GREY_DIM, C_GREY_BG, 1);
-    draw_session_dots(C_GREY_DIM);
+    draw_centred(78, "Connect via BLE:", C_GREY_DIM, C_GREY_BG, 1);
+    draw_centred(92, DEVICE_NAME,        C_GREY_LT,  C_GREY_BG, 1);
+    draw_centred(106, "waiting...",      C_GREY_DIM, C_GREY_BG, 1);
+    draw_bottom_bar(C_GREY_DIM);
     draw_theme_overlay();
 }
 
@@ -682,8 +717,8 @@ static void draw_standby(void)
         extra_y = 2;
     }
     draw_eyes_split(EYE_L_X+ox, EYE_R_X+ox, EYE_Y+extra_y, L, R, C_EYE);
-    draw_centred(108, "BLE connected", C_FAINT, C_ORANGE, 1);
-    draw_session_dots(C_DIM);
+    draw_centred(98, "BLE connected", C_FAINT, C_ORANGE, 1);
+    draw_bottom_bar(C_DIM);
     draw_theme_overlay();
 }
 
@@ -706,8 +741,8 @@ static void draw_thinking(void)
         else if (s_blink_variant == BLINK_EYE_ROLL) { L = R = EYE_OPEN; extra_y = -4; }
     }
     draw_eyes_split(EYE_L_X+ox, EYE_R_X+ox, EYE_Y+oy+extra_y, L, R, C_EYE);
-    draw_centred(108, "thinking...", C_DIM, C_ORANGE, 1);
-    draw_session_dots(C_DIM);
+    draw_centred(98, "thinking...", C_DIM, C_ORANGE, 1);
+    draw_bottom_bar(C_DIM);
     // Tool icon replaces theme badge while a tool is active
     if (s_tool != TOOL_NONE) draw_tool_overlay();
     else                     draw_theme_overlay();
@@ -719,15 +754,15 @@ static void draw_done(void)
     draw_centred(8, "DONE!", C_CHECK, C_DONE_BG, 1);
     int ox = (int)s_eye_ox;
     draw_eyes(EYE_L_X+ox, EYE_R_X+ox, 42, EYE_HAPPY, C_EYE);
-    draw_thick_line(45,83, 57,95, 5, C_TICK);
-    draw_thick_line(57,95, 86,66, 5, C_TICK);
+    draw_thick_line(45,73, 57,85, 5, C_TICK);
+    draw_thick_line(57,85, 86,56, 5, C_TICK);
     int64_t secs = (esp_timer_get_time() - s_notify_us) / 1000000LL;
     char elapsed[20];
     if (secs < 5)       snprintf(elapsed, sizeof(elapsed), "just now");
     else if (secs < 60) snprintf(elapsed, sizeof(elapsed), "%llds ago", (long long)secs);
     else                snprintf(elapsed, sizeof(elapsed), "%lldm ago", (long long)(secs/60));
-    draw_centred(110, elapsed, C_DONE_DIM, C_DONE_BG, 1);
-    draw_session_dots(C_DONE_DIM);
+    draw_centred(100, elapsed, C_DONE_DIM, C_DONE_BG, 1);
+    draw_bottom_bar(C_DONE_DIM);
     draw_theme_overlay();
 }
 
@@ -738,8 +773,8 @@ static void draw_waiting(void)
     int ox = (int)s_eye_ox;
     draw_pixel_eye(EYE_L_X+ox, EYE_Y, &BMP_CHEVRON_R[0][0], 5, C_BLUE_EYE);
     draw_pixel_eye(EYE_R_X+ox, EYE_Y, &BMP_CHEVRON_L[0][0], 5, C_BLUE_EYE);
-    draw_centred(106, "your input?", C_BLUE_LT, C_BLUE_BG, 1);
-    draw_session_dots(C_BLUE_DIM);
+    draw_centred(96, "your input?", C_BLUE_LT, C_BLUE_BG, 1);
+    draw_bottom_bar(C_BLUE_DIM);
     draw_theme_overlay();
 }
 
@@ -757,8 +792,8 @@ static void draw_dizzy(void)
     draw_pixel_eye(EYE_R_X-wobble_x, EYE_Y-wobble_y, bmp, 4, C_DIZZY_EYE);
     // Stars/asterisks above head
     const char *stars[] = {"* + *", "+ * +", "* . *"};
-    draw_centred(86, stars[(s_spin/6)%3], C_DIZZY_LT, C_DIZZY_BG, 1);
-    draw_centred(108, "...dizzy...", C_DIZZY_DIM, C_DIZZY_BG, 1);
+    draw_centred(76, stars[(s_spin/6)%3], C_DIZZY_LT, C_DIZZY_BG, 1);
+    draw_centred(98, "...dizzy...", C_DIZZY_DIM, C_DIZZY_BG, 1);
 }
 
 static void draw_sleepy(void)
@@ -772,7 +807,7 @@ static void draw_sleepy(void)
     int ox = (int)s_eye_ox;
     draw_pixel_eye(EYE_L_X+ox, EYE_Y+4, &BMP_SLEEP[0][0], 2, C_SLEEPY_LT);
     draw_pixel_eye(EYE_R_X+ox, EYE_Y+4, &BMP_SLEEP[0][0], 2, C_SLEEPY_LT);
-    draw_centred(108, "...zzz...", C_SLEEPY_DIM, C_SLEEPY_BG, 1);
+    draw_centred(98, "...zzz...", C_SLEEPY_DIM, C_SLEEPY_BG, 1);
 }
 
 static void draw_disco(void)
@@ -796,7 +831,7 @@ static void draw_disco(void)
     int oy = (int)(4.0f * cosf(s_party * 0.4f));
     draw_pixel_eye(EYE_L_X+ox, EYE_Y+oy, &BMP_STAR[0][0], 4, fg);
     draw_pixel_eye(EYE_R_X-ox, EYE_Y+oy, &BMP_STAR[0][0], 4, fg);
-    draw_centred(108, "DISCO MODE!", fg, bg, 1);
+    draw_centred(98, "DISCO MODE!", fg, bg, 1);
 }
 
 // ─── BLE command callback (called from NimBLE task) ──────────────────────────
@@ -859,6 +894,18 @@ static void on_ble_cmd(ble_cmd_t cmd, const char *arg)
         if (n > 4) n = 4;
         s_sessions = n;
         ESP_LOGI(TAG, "sessions: %d", n);
+        break;
+    }
+    case BLE_CMD_BAR: {
+        if (!arg) break;
+        int n = 0;
+        for (int i = 0; i < 4 && arg[i] && arg[i] != '\n' && arg[i] != '\r'; i++) {
+            char c = arg[i];
+            s_bar_states[i] = (c == 'T' || c == 'W' || c == 'D') ? c : '.';
+            n++;
+        }
+        s_bar_count = n;
+        ESP_LOGI(TAG, "bar: %.*s (n=%d)", n, arg, n);
         break;
     }
     }
