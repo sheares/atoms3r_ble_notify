@@ -79,6 +79,11 @@ static volatile int s_sessions = 1;
 static volatile char s_bar_states[4] = {'.','.','.','.'};
 static volatile int  s_bar_count     = 0;
 
+// Per-session labels — short (max 5 char) text drawn above each bar segment.
+// Filled by BLE_CMD_LABELS (pipe-separated). Empty string = no label drawn.
+#define LABEL_MAX 6
+static char s_labels[4][LABEL_MAX] = {{0},{0},{0},{0}};
+
 static volatile app_state_t s_app_state = APP_DISCONNECTED;
 static app_state_t          s_prev_state = APP_STANDBY;
 static volatile int64_t     s_notify_us = 0;
@@ -676,8 +681,18 @@ static void draw_bottom_bar(uint16_t fallback)
     for (int i = 0; i < n; i++) {
         int x = i * seg_w;
         int w = (i == n - 1) ? (LCD_WIDTH - x) : seg_w;
-        gc9107_fill_rect(x, BAR_Y, w, BAR_H, bar_seg_color(s_bar_states[i], fallback));
+        uint16_t bg = bar_seg_color(s_bar_states[i], fallback);
+        gc9107_fill_rect(x, BAR_Y, w, BAR_H, bg);
         if (i > 0) gc9107_fill_rect(x, BAR_Y, 1, BAR_H, RGB565(0,0,0));
+        // Label centered inside the segment (white on segment color)
+        const char *lbl = s_labels[i];
+        if (lbl[0]) {
+            int len  = (int)strlen(lbl);
+            int text_w = len * 6 - 1;  // 5px char + 1px gap, scale 1, no trailing gap
+            int tx = x + (w - text_w) / 2;
+            if (tx < x + 1) tx = x + 1;  // keep clear of divider
+            gc9107_draw_string(tx, BAR_Y + 1, lbl, C_WHITE, bg, 1);
+        }
     }
 }
 
@@ -906,6 +921,24 @@ static void on_ble_cmd(ble_cmd_t cmd, const char *arg)
         }
         s_bar_count = n;
         ESP_LOGI(TAG, "bar: %.*s (n=%d)", n, arg, n);
+        break;
+    }
+    case BLE_CMD_LABELS: {
+        if (!arg) break;
+        // Parse pipe-separated labels into s_labels[4][LABEL_MAX]
+        for (int i = 0; i < 4; i++) s_labels[i][0] = 0;
+        int slot = 0, col = 0;
+        for (int i = 0; arg[i] && arg[i] != '\n' && arg[i] != '\r' && slot < 4; i++) {
+            if (arg[i] == '|') {
+                s_labels[slot][col] = 0;
+                slot++;
+                col = 0;
+            } else if (col < LABEL_MAX - 1) {
+                s_labels[slot][col++] = arg[i];
+            }
+        }
+        if (slot < 4) s_labels[slot][col] = 0;
+        ESP_LOGI(TAG, "labels: %s", arg);
         break;
     }
     }

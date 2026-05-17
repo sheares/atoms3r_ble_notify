@@ -56,10 +56,13 @@ _current_theme: str = ""
 _session_seen:   dict[str, float] = {}
 _session_states: dict[str, str]   = {}
 _session_slots:  dict[str, int]   = {}
-_last_bar_payload:  str = ""
-_last_face_state:   str = ""
+_session_labels: dict[str, str]   = {}
+_last_bar_payload:    str = ""
+_last_face_state:     str = ""
+_last_labels_payload: str = ""
 SESSION_TTL_S = 5 * 60
 MAX_SLOTS     = 4
+LABEL_MAX_CHARS = 5
 
 
 # ─── Singapore holiday calendar ──────────────────────────────────────────────
@@ -133,10 +136,11 @@ async def _connect_loop() -> None:
             # Push today's theme + current hour on connect
             await _push_theme()
             await _push_time()
-            # Force a re-broadcast of bar + face so reconnects refresh state.
-            global _last_bar_payload, _last_face_state
+            # Force a re-broadcast of bar + labels + face so reconnects refresh state.
+            global _last_bar_payload, _last_face_state, _last_labels_payload
             _last_bar_payload = ""
             _last_face_state = ""
+            _last_labels_payload = ""
             await _broadcast_session_view()
             return
         except Exception as exc:
@@ -169,6 +173,7 @@ def _evict_old_sessions() -> None:
         _session_seen.pop(sid, None)
         _session_states.pop(sid, None)
         _session_slots.pop(sid, None)
+        _session_labels.pop(sid, None)
 
 
 def _alloc_slot(sid: str) -> int | None:
@@ -195,6 +200,18 @@ def _build_bar_payload() -> str:
     return "".join(slots)
 
 
+def _build_labels_payload() -> str:
+    """Build pipe-separated labels string aligned to bar slots.
+    e.g. 'esp|main||blog' (empty slot in middle). Returns '' if no slots."""
+    if not _session_slots:
+        return ""
+    highest = max(_session_slots.values())
+    slots = [""] * (highest + 1)
+    for sid, idx in _session_slots.items():
+        slots[idx] = _session_labels.get(sid, "")
+    return "|".join(slots)
+
+
 def _compute_face_state() -> str:
     """Pick the face command based on highest-urgency state across sessions.
     Priority: W (waiting) > D (done) > T (thinking) > standby."""
@@ -206,29 +223,40 @@ def _compute_face_state() -> str:
 
 
 async def _broadcast_session_view() -> None:
-    """Send bar + face commands if either has changed since the last broadcast."""
-    global _last_bar_payload, _last_face_state
+    """Send bar + labels + face commands if any has changed since last broadcast."""
+    global _last_bar_payload, _last_face_state, _last_labels_payload
     bar = _build_bar_payload()
+    labels = _build_labels_payload()
     face = _compute_face_state()
     if bar != _last_bar_payload:
         _last_bar_payload = bar
         if bar:
             await _send(f"bar {bar}")
         # No-bar case: nothing to send; firmware will fall back on next render.
+    if labels != _last_labels_payload:
+        _last_labels_payload = labels
+        if labels:
+            await _send(f"labels {labels}")
     if face != _last_face_state:
         _last_face_state = face
         await _send(face)
 
 
-async def _set_session_state(session_id: str | None, state: str | None) -> None:
-    """Mark a session as seen and (optionally) update its bar state.
+async def _set_session_state(
+    session_id: str | None,
+    state: str | None,
+    label: str | None = None,
+) -> None:
+    """Mark a session as seen and (optionally) update its bar state and label.
     state in {'T','W','D', None}; None just refreshes the seen-time (e.g. /tool).
-    Broadcasts updated bar + face if anything changed."""
+    label is a short repo/cwd name (5 chars max). Broadcasts if anything changed."""
     if session_id:
         _session_seen[session_id] = time.monotonic()
         if state is not None:
             _alloc_slot(session_id)
             _session_states[session_id] = state
+        if label:
+            _session_labels[session_id] = label[:LABEL_MAX_CHARS]
     _evict_old_sessions()
     await _broadcast_session_view()
 
@@ -264,6 +292,13 @@ def _sid(req: web.Request) -> str | None:
     return sid if sid else None
 
 
+def _label(req: web.Request) -> str | None:
+    """Pull session label from query string. Sanitised to alphanumeric+_- only."""
+    raw = req.query.get("label", "")
+    clean = "".join(c for c in raw if c.isalnum() or c in "_-")
+    return clean[:LABEL_MAX_CHARS] if clean else None
+
+
 async def handle_thinking(req: web.Request) -> web.Response:
     global _last_dizzy_ts
     sid = _sid(req)
@@ -279,28 +314,28 @@ async def handle_thinking(req: web.Request) -> web.Response:
         _thinking_history.clear()
         log.info("rapid-fire detected → dizzy")
         # Still update bar state so it's accurate after dizzy clears.
-        await _set_session_state(sid, "T")
+        await _set_session_state(sid, "T", _label(req))
         await _send("dizzy")
         return web.Response(text="OK (dizzy)\n")
 
-    await _set_session_state(sid, "T")
+    await _set_session_state(sid, "T", _label(req))
     return web.Response(text="OK\n")
 
 
 async def handle_question(req: web.Request) -> web.Response:
-    await _set_session_state(_sid(req), "W")
+    await _set_session_state(_sid(req), "W", _label(req))
     return web.Response(text="OK\n")
 
 
 async def handle_notify(req: web.Request) -> web.Response:
-    await _set_session_state(_sid(req), "D")
+    await _set_session_state(_sid(req), "D", _label(req))
     return web.Response(text="OK\n")
 
 
 async def handle_clear(req: web.Request) -> web.Response:
     # Manual override — forces face to standby without touching per-session state.
     # (Per-session state is still refreshed via the seen-time path.)
-    await _set_session_state(_sid(req), None)
+    await _set_session_state(_sid(req), None, _label(req))
     await _send("standby")
     return web.Response(text="OK\n")
 
@@ -338,7 +373,7 @@ _TOOL_ALIAS = {
 
 async def handle_tool(req: web.Request) -> web.Response:
     # Tool calls just refresh seen-time; they don't change the bar state.
-    await _set_session_state(_sid(req), None)
+    await _set_session_state(_sid(req), None, _label(req))
     name = req.match_info.get("name", "").strip().lower()
     if not name:
         await _send("tool")  # clear
@@ -349,7 +384,7 @@ async def handle_tool(req: web.Request) -> web.Response:
 
 
 async def handle_tool_clear(req: web.Request) -> web.Response:
-    await _set_session_state(_sid(req), None)
+    await _set_session_state(_sid(req), None, _label(req))
     await _send("tool")
     return web.Response(text="OK tool=(clear)\n")
 
