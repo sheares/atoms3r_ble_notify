@@ -13,27 +13,12 @@
 ENDPOINT="$1"
 J=$(cat 2>/dev/null || true)
 S=$(printf '%s' "$J" | jq -r '.session_id // empty' 2>/dev/null || true)
-# Pull cwd from the hook payload (falls back to current working dir), take
-# the basename, then pick the longest token (split by _ - space) that fits
-# in LABEL_MAX chars. If nothing fits, truncate the full basename.
+# Pull cwd from the hook payload (falls back to current working dir) and
+# send the sanitized basename. Daemon picks the best short form based on
+# how many segments will share the bar.
 CWD=$(printf '%s' "$J" | jq -r '.cwd // empty' 2>/dev/null || true)
 [ -z "$CWD" ] && CWD="$PWD"
-LABEL_MAX=5
-BASE=$(basename "$CWD")
-LABEL=$(printf '%s' "$BASE" | awk -v M=$LABEL_MAX '
-{
-    gsub(/[ _-]+/, "\n")
-    n = split($0, tok, "\n")
-    best = ""
-    for (i = 1; i <= n; i++) {
-        t = tok[i]
-        gsub(/[^A-Za-z0-9]/, "", t)
-        if (length(t) <= M && length(t) > length(best)) best = t
-    }
-    if (best == "") best = substr($0, 1, M)
-    gsub(/[^A-Za-z0-9]/, "", best)
-    print best
-}')
+LABEL=$(basename "$CWD" | tr -cd 'A-Za-z0-9_ -')
 
 case "$ENDPOINT" in
     tool)

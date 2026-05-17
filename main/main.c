@@ -79,9 +79,11 @@ static volatile int s_sessions = 1;
 static volatile char s_bar_states[4] = {'.','.','.','.'};
 static volatile int  s_bar_count     = 0;
 
-// Per-session labels — short (max 5 char) text drawn above each bar segment.
+// Per-session labels — short text drawn inside each bar segment. Daemon
+// sizes them based on slot count (more slots → tighter budget). 21 chars
+// fits when there's only 1 session sharing the whole 128px-wide bar.
 // Filled by BLE_CMD_LABELS (pipe-separated). Empty string = no label drawn.
-#define LABEL_MAX 6
+#define LABEL_MAX 22
 static char s_labels[4][LABEL_MAX] = {{0},{0},{0},{0}};
 
 static volatile app_state_t s_app_state = APP_DISCONNECTED;

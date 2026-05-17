@@ -20,6 +20,7 @@ Side effects:
 
 import asyncio
 import logging
+import re
 import sys
 import time
 from collections import deque
@@ -62,7 +63,10 @@ _last_face_state:     str = ""
 _last_labels_payload: str = ""
 SESSION_TTL_S = 5 * 60
 MAX_SLOTS     = 4
-LABEL_MAX_CHARS = 5
+LCD_WIDTH     = 128
+CHAR_PX       = 6      # 5x8 font + 1px spacing
+SEG_PADDING   = 2      # divider + a hair of margin
+LABEL_HARD_MAX = 21    # firmware buffer cap (s_labels[4][22])
 
 
 # ─── Singapore holiday calendar ──────────────────────────────────────────────
@@ -200,15 +204,43 @@ def _build_bar_payload() -> str:
     return "".join(slots)
 
 
+def _chars_per_segment(n_slots: int) -> int:
+    """How many chars fit in one bar segment when n_slots share the 128px bar."""
+    if n_slots < 1:
+        return LABEL_HARD_MAX
+    seg_w = LCD_WIDTH // n_slots
+    fits = (seg_w - SEG_PADDING) // CHAR_PX
+    return max(2, min(LABEL_HARD_MAX, fits))
+
+
+_TOKEN_SPLIT = re.compile(r"[ _\-]+")
+
+
+def _fit_label(raw: str, max_chars: int) -> str:
+    """Trim a label to max_chars. If it doesn't fit, prefer the longest single
+    token (split on _ - space) that does; fall back to hard truncation."""
+    if len(raw) <= max_chars:
+        return raw
+    tokens = [t for t in _TOKEN_SPLIT.split(raw) if t]
+    fits = [t for t in tokens if len(t) <= max_chars]
+    if fits:
+        return max(fits, key=len)
+    return raw[:max_chars]
+
+
 def _build_labels_payload() -> str:
     """Build pipe-separated labels string aligned to bar slots.
-    e.g. 'esp|main||blog' (empty slot in middle). Returns '' if no slots."""
+    Per-label width depends on slot count (more slots → tighter budget).
+    Returns '' if no slots."""
     if not _session_slots:
         return ""
     highest = max(_session_slots.values())
-    slots = [""] * (highest + 1)
+    n_slots = highest + 1
+    budget = _chars_per_segment(n_slots)
+    slots = [""] * n_slots
     for sid, idx in _session_slots.items():
-        slots[idx] = _session_labels.get(sid, "")
+        raw = _session_labels.get(sid, "")
+        slots[idx] = _fit_label(raw, budget) if raw else ""
     return "|".join(slots)
 
 
@@ -256,7 +288,7 @@ async def _set_session_state(
             _alloc_slot(session_id)
             _session_states[session_id] = state
         if label:
-            _session_labels[session_id] = label[:LABEL_MAX_CHARS]
+            _session_labels[session_id] = label[:LABEL_HARD_MAX]
     _evict_old_sessions()
     await _broadcast_session_view()
 
@@ -293,10 +325,12 @@ def _sid(req: web.Request) -> str | None:
 
 
 def _label(req: web.Request) -> str | None:
-    """Pull session label from query string. Sanitised to alphanumeric+_- only."""
+    """Pull session label from query string. Sanitised; daemon trims width
+    later based on how many slots will share the bar."""
     raw = req.query.get("label", "")
-    clean = "".join(c for c in raw if c.isalnum() or c in "_-")
-    return clean[:LABEL_MAX_CHARS] if clean else None
+    clean = "".join(c for c in raw if c.isalnum() or c in "_- ")
+    clean = clean.strip()[:LABEL_HARD_MAX]
+    return clean if clean else None
 
 
 async def handle_thinking(req: web.Request) -> web.Response:
